@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(source:*)",
+      "Bash(pip show:*)",
+      "Bash(nvcc:*)",
+      "Bash(pip uninstall:*)",
+      "Bash(pip install:*)",
+      "Bash(pip cache:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

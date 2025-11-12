@@ -5,3 +5,5 @@
 output/.parquet_chunks/
 .env
 *.env
+train/output/
+train/tokenizers/

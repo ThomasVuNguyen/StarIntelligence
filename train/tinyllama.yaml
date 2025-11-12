@@ -1,0 +1,102 @@
+checkpoints:
+  checkpoint_interval: 2000            # save at end of smoke run
+  checkpoints_path: checkpoints
+  checkpoints_path_is_shared_file_system: true
+  resume_checkpoint_path: null
+  save_initial_state: true
+
+data_stages:
+- name: Stable Training Stage
+  start_training_step: 1
+  data:
+    dataset: null                      # <-- set to your interleaved HF dataset
+    num_loading_workers: 4
+    seed: 42
+
+general:
+  benchmark_csv_path: benchmark_llama.csv
+  consumed_train_samples: null
+  ignore_sanity_checks: true
+  project: debug
+  run: tiny_llama_%date_%jobid
+  seed: 42
+  step: null
+
+lighteval: null
+
+logging:
+  iteration_step_info_interval: 10
+  log_level: info
+  log_level_replica: warning
+
+model:
+  ddp_bucket_cap_mb: 25
+  dtype: bfloat16
+  init_method:
+    std: 0.025
+  make_vocab_size_divisible_by: 64
+  model_config:
+    bos_token_id: 1
+    eos_token_id: 2
+    hidden_act: silu
+    hidden_size: 2048
+    initializer_range: 0.02
+    intermediate_size: 7168
+    is_llama_config: true
+    max_position_embeddings: 4096       # align with sequence_length for smoke
+    num_attention_heads: 32
+    num_hidden_layers: 24
+    num_key_value_heads: 8
+    pad_token_id: null
+    pretraining_tp: 1
+    rms_norm_eps: 1.0e-05
+    rope_scaling: null
+    tie_word_embeddings: true
+    use_cache: false
+    vocab_size: 128256                  # <-- ensure matches tokenizer
+  # memory savers (nanotron supports these at model level)
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+
+optimizer:
+  accumulate_grad_in_fp32: true
+  clip_grad: 1.0
+  learning_rate_scheduler:
+    learning_rate: 0.0003
+    lr_warmup_steps: 200                # 10% warmup of 2k
+    lr_decay_steps: 1800                # decay over remaining steps
+    lr_decay_style: cosine
+    lr_warmup_style: linear
+    min_decay_lr: 3.0e-05
+  optimizer_factory:
+    name: adamW
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    torch_adam_is_fused: true
+  weight_decay: 0.1
+  zero_stage: 1
+
+parallelism:
+  dp: 2                                 # 2× Ada 6000 (49 GB)
+  tp: 1                                 # simpler/more stable on 49 GB
+  pp: 1
+  pp_engine: 1f1b
+  expert_parallel_size: 1
+  tp_linear_async_communication: true
+  tp_mode: REDUCE_SCATTER
+
+profiler:
+  profiler_export_path: ./tb_logs/fix/
+
+tokenizer:
+  tokenizer_max_length: 4096
+  tokenizer_name_or_path: robot-test/dummy-tokenizer-wordlevel  # <-- replace
+  tokenizer_revision: null
+
+tokens:
+  micro_batch_size: 1
+  batch_accumulation_per_replica: 8     # increase if VRAM allows
+  sequence_length: 4096
+  train_steps: 2000                      # smoke test length
+  val_check_interval: 500               # do a quick sanity eval
