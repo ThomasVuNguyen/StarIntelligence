@@ -27,36 +27,56 @@ def load_hf_token():
 
 HF_TOKEN = load_hf_token()
 
-dataset = load_dataset("ThomasTheMaker/Arc-Corpus-sample", split="train")  # load the dataset
-dataset = dataset.select(range(20))  # keep only 20 rows for quick tokenizer runs
+RAW_DATASET_NAME = "ThomasTheMaker/Arc-Corpus"
 
-def format_prompts(examples):
+tokenizer_corpus = load_dataset(
+    RAW_DATASET_NAME,
+    split="train",
+    streaming=True,
+)
+tokenizer_corpus = tokenizer_corpus.shuffle(buffer_size=1_000_000, seed=1234)
+
+dataset = load_dataset(
+    RAW_DATASET_NAME,
+    split="train",
+    streaming=True,
+)
+dataset = dataset.shuffle(buffer_size=1_000_000, seed=42)
+
+def format_prompt(example):
     """
     Wrap raw dataset rows into the chat format expected by the tokenizer/model.
     """
-    formatted = []
-    for text in examples["text"]:
-        content = (text or "").strip()
-        if not content:
-            content = "No content provided."
-        conversation = (
-            "<|user|>\n"
-            "Share a helpful continuation for the following document.\n"
-            "<|end|>\n"
-            "<|bot|>\n"
-            f"{content}\n"
-            "<|end|>"
-        )
-        formatted.append(conversation)
-    return {"text": formatted}
+    content = (example.get("text") or "").strip()
+    if not content:
+        content = "No content provided."
+    conversation = (
+        "<|user|>\n"
+        "Share a helpful continuation for the following document.\n"
+        "<|end|>\n"
+        "<|bot|>\n"
+        f"{content}\n"
+        "<|end|>"
+    )
+    return {"text": conversation}
 
-dataset = dataset.map(format_prompts, batched=True)
+original_columns = dataset.column_names
+dataset = dataset.map(
+    format_prompt,
+    remove_columns=original_columns,
+)
 
-print(dataset["text"][2])  # sanity check
+try:
+    sample = next(iter(dataset.take(1)))
+    print(sample["text"])
+except StopIteration:
+    raise ValueError("Dataset is empty after formatting; please verify the source dataset.")
 
 def get_training_corpus():
-    for i in range(0, len(dataset), 1000):
-        yield dataset[i : i + 1000]["text"]
+    for row in tokenizer_corpus:
+        text = (row.get("text") or "").strip()
+        if text:
+            yield text
 
 training_corpus = get_training_corpus()
 
@@ -153,12 +173,19 @@ model = LlamaForCausalLM(config)
 
 sft_config = SFTConfig(
     output_dir="output",
-    num_train_epochs=4,
-    per_device_train_batch_size=16,
-    learning_rate=1e-4,
-    optim="sgd",
+    num_train_epochs=1,
+    max_steps=50_000,
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=16,
+    learning_rate=2e-4,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.03,
+    optim="adamw_torch",
+    logging_steps=100,
+    save_strategy="steps",
+    save_steps=5_000,
     dataset_text_field="text",
-    max_length=512,
+    max_length=4_096,
     push_to_hub=True,
     hub_model_id="ThomasTheMaker/Arc",
 )
