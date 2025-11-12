@@ -26,7 +26,7 @@ OUTPUT_FILE = 'fineweb.json'
 CHECKPOINT_FILE = 'fineweb_checkpoint.txt'
 
 # Target word count (5 billion)
-TARGET_WORDS = 5_000_000_000
+TARGET_WORDS = 500_000_000_000
 
 
 def count_words(text):
