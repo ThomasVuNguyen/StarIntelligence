@@ -1,13 +1,23 @@
 pretrain:
   dataset:
     - name: ThomasTheMaker/arc-fineweb
-      rows: 1000
+      rows: All
+    - name: ThomasTheMaker/arc-dclm
+      rows: All
+    - name: ThomasTheMaker/Starmind-corpus-c
+      rows: All
+    - name: ThomasTheMaker/Starmind-corpus-cpp
+      rows: All
+    - name: ThomasTheMaker/Starmind-corpus-js
+      rows: All
+    - name: ThomasTheMaker/Starmind-corpus-python
+      rows: All
   training:
     tokenizer: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     batch_size: 1
     grad_accum_steps: 2
-    num_epochs: 1
-    learning_rate: 3.0e-4
+    num_epochs: 4
+    learning_rate: 2.0e-5
     weight_decay: 0.1
     warmup_ratio: 0.01
     grad_clip: 1.0

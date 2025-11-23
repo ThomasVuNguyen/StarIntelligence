@@ -5,6 +5,7 @@ import time
 import random
 import yaml
 import shutil
+import csv
 from itertools import islice, chain
 
 import numpy as np
@@ -18,6 +19,9 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 if not HF_TOKEN:
@@ -95,7 +99,12 @@ total_rows = 0
 for ds_config in datasets_config:
     ds_name = ds_config["name"]
     ds_rows = ds_config.get("rows", None)
-    print(f"   Loading {ds_name} (rows: {ds_rows if ds_rows else 'all'})")
+    
+    # Support "All" as a string value to explicitly train on all rows
+    if isinstance(ds_rows, str) and ds_rows.lower() == "all":
+        ds_rows = None
+    
+    print(f"   Loading {ds_name} (rows: {ds_rows if ds_rows is not None else 'all'})")
 
     stream = load_dataset(
         ds_name,
@@ -104,7 +113,7 @@ for ds_config in datasets_config:
         token=HF_TOKEN,
     )
 
-    if ds_rows:
+    if ds_rows is not None:
         stream = stream.take(ds_rows)
         total_rows += ds_rows
 
@@ -124,8 +133,13 @@ temp_streams = []
 for ds_config in datasets_config:
     ds_name = ds_config["name"]
     ds_rows = ds_config.get("rows", None)
+    
+    # Support "All" as a string value
+    if isinstance(ds_rows, str) and ds_rows.lower() == "all":
+        ds_rows = None
+    
     stream = load_dataset(ds_name, split="train", streaming=True, token=HF_TOKEN)
-    if ds_rows:
+    if ds_rows is not None:
         stream = stream.take(ds_rows)
     temp_streams.append(stream.map(ensure_text))
 
@@ -138,16 +152,26 @@ for i, ex in enumerate(islice(temp_combined, sample_size)):
 avg_tokens_per_doc = sample_tokens / max(sample_size, 1)
 print(f"   Sampled {sample_size} documents, avg {avg_tokens_per_doc:.1f} tokens/doc")
 
-num_docs = total_rows if total_rows > 0 else sample_size
-estimated_tokens = int(num_docs * avg_tokens_per_doc)
-print(f"   Using {num_docs:,} documents")
-print(f"   Estimated total tokens: {estimated_tokens:,}")
-
 TOKENS_PER_STEP = BLOCK_SIZE * BATCH_SIZE * GRAD_ACCUM_STEPS
-TOTAL_STEPS = max(1, (estimated_tokens * NUM_EPOCHS) // TOKENS_PER_STEP)
-print(f"[*] Training for {TOTAL_STEPS:,} steps ({NUM_EPOCHS} epoch(s))")
-print(f"   Tokens per step: {TOKENS_PER_STEP:,}")
-print(f"   Total tokens: {estimated_tokens * NUM_EPOCHS:,}")
+
+if total_rows > 0:
+    # Known dataset size - can estimate steps accurately
+    estimated_tokens = int(total_rows * avg_tokens_per_doc)
+    TOTAL_STEPS = max(1, (estimated_tokens * NUM_EPOCHS) // TOKENS_PER_STEP)
+    print(f"   Using {total_rows:,} documents")
+    print(f"   Estimated total tokens: {estimated_tokens:,}")
+    print(f"[*] Training for approximately {TOTAL_STEPS:,} steps ({NUM_EPOCHS} epoch(s))")
+    print(f"   Tokens per step: {TOKENS_PER_STEP:,}")
+else:
+    # Unknown dataset size - train until exhaustion
+    # Use a large estimate for scheduler warmup calculation
+    estimated_tokens = int(sample_size * avg_tokens_per_doc * 100)  # Conservative multiplier
+    TOTAL_STEPS = max(1, (estimated_tokens * NUM_EPOCHS) // TOKENS_PER_STEP)
+    print(f"   Dataset size unknown - will train until data exhaustion")
+    print(f"   Estimated avg tokens/doc: {avg_tokens_per_doc:.1f}")
+    print(f"[*] Training for {NUM_EPOCHS} epoch(s) until data exhaustion")
+    print(f"   Tokens per step: {TOKENS_PER_STEP:,}")
+    print(f"   Using conservative estimate of ~{TOTAL_STEPS:,} steps for scheduler")
 print()
 
 # Build model from config
@@ -230,12 +254,14 @@ scaler = GradScaler(enabled=use_fp16)
 print("[*] Starting pretraining...")
 print(
     f"   BLOCK_SIZE={BLOCK_SIZE}, BATCH_SIZE={BATCH_SIZE}, "
-    f"GRAD_ACCUM_STEPS={GRAD_ACCUM_STEPS}, TOTAL_STEPS={TOTAL_STEPS}"
+    f"GRAD_ACCUM_STEPS={GRAD_ACCUM_STEPS}"
 )
 print(
     f"   Effective tokens/step = {BLOCK_SIZE * BATCH_SIZE * GRAD_ACCUM_STEPS:,}"
 )
 print(f"   Learning rate: {LEARNING_RATE}, Warmup steps: {num_warmup_steps}")
+if total_rows == 0:
+    print(f"   Will train until data is exhausted (no step limit)")
 print()
 
 global_step = 0
@@ -245,6 +271,19 @@ start_time = time.time()
 window_start_time = time.time()
 window_start_step = 0
 
+# Initialize CSV logging
+csv_path = os.path.join(OUTPUT_DIR, "training_log.csv")
+csv_file = open(csv_path, 'w', newline='')
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(["step", "loss", "learning_rate", "tokens_per_sec", "elapsed_time"])
+csv_file.flush()
+
+# Track all metrics for plotting
+all_steps = []
+all_losses = []
+all_lrs = []
+all_tok_per_sec = []
+
 def multi_epoch_stream(datasets_config, num_epochs):
     for epoch in range(num_epochs):
         print(f"[*] Starting epoch {epoch + 1}/{num_epochs}")
@@ -252,8 +291,13 @@ def multi_epoch_stream(datasets_config, num_epochs):
         for ds_config in datasets_config:
             ds_name = ds_config["name"]
             ds_rows = ds_config.get("rows", None)
+            
+            # Support "All" as a string value
+            if isinstance(ds_rows, str) and ds_rows.lower() == "all":
+                ds_rows = None
+            
             stream = load_dataset(ds_name, split="train", streaming=True, token=HF_TOKEN)
-            if ds_rows:
+            if ds_rows is not None:
                 stream = stream.take(ds_rows)
             streams.append(stream.map(ensure_text))
 
@@ -268,11 +312,13 @@ block_iter = token_block_stream(multi_epoch_data, tokenizer, BLOCK_SIZE, eos_id)
 
 model.train()
 
+# Always use TOTAL_STEPS for progress bar to show ETA
+# When training to exhaustion, this is a conservative estimate
 pbar = tqdm(total=TOTAL_STEPS, desc="Training", unit="step")
 
 autocast_ctx = autocast(enabled=(use_bf16 or use_fp16), dtype=torch.bfloat16 if use_bf16 else torch.float16)
 with autocast_ctx:
-    while global_step < TOTAL_STEPS:
+    while True:  # Train until data exhaustion
         blocks = []
         for _ in range(BATCH_SIZE):
             try:
@@ -283,7 +329,8 @@ with autocast_ctx:
                 break
 
         if len(blocks) < BATCH_SIZE:
-            print(f"   Completed training with partial batch of {len(blocks)} blocks")
+            if len(blocks) > 0:
+                print(f"   Completed training with partial batch of {len(blocks)} blocks")
             break
 
         input_ids = torch.stack(blocks).to(device)
@@ -338,6 +385,17 @@ with autocast_ctx:
                     "tok/s": f"{int(window_tps):,}"
                 })
 
+                # Log to CSV
+                elapsed_total = time.time() - start_time
+                csv_writer.writerow([global_step, avg_loss, current_lr, window_tps, elapsed_total])
+                csv_file.flush()
+                
+                # Track for plotting
+                all_steps.append(global_step)
+                all_losses.append(avg_loss)
+                all_lrs.append(current_lr)
+                all_tok_per_sec.append(window_tps)
+
                 running_loss = 0.0
                 window_start_time = time.time()
                 window_start_step = global_step
@@ -355,8 +413,49 @@ with autocast_ctx:
                     'scheduler_state_dict': scheduler.state_dict(),
                     'scaler_state_dict': scaler.state_dict() if use_fp16 else None,
                 }, os.path.join(ckpt_dir, "training_state.pt"))
+                
+                # Generate training plots
+                print("[*] Generating training plots...")
+                fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+                
+                # Loss plot
+                axes[0, 0].plot(all_steps, all_losses, linewidth=2, color='#2E86AB')
+                axes[0, 0].set_xlabel('Step', fontsize=12)
+                axes[0, 0].set_ylabel('Loss', fontsize=12)
+                axes[0, 0].set_title('Training Loss', fontsize=14, fontweight='bold')
+                axes[0, 0].grid(True, alpha=0.3)
+                
+                # Learning rate plot
+                axes[0, 1].plot(all_steps, all_lrs, linewidth=2, color='#A23B72')
+                axes[0, 1].set_xlabel('Step', fontsize=12)
+                axes[0, 1].set_ylabel('Learning Rate', fontsize=12)
+                axes[0, 1].set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+                axes[0, 1].grid(True, alpha=0.3)
+                axes[0, 1].ticklabel_format(style='scientific', axis='y', scilimits=(0,0))
+                
+                # Tokens per second plot
+                axes[1, 0].plot(all_steps, all_tok_per_sec, linewidth=2, color='#F18F01')
+                axes[1, 0].set_xlabel('Step', fontsize=12)
+                axes[1, 0].set_ylabel('Tokens/sec', fontsize=12)
+                axes[1, 0].set_title('Training Throughput', fontsize=14, fontweight='bold')
+                axes[1, 0].grid(True, alpha=0.3)
+                
+                # Loss (log scale) plot
+                axes[1, 1].plot(all_steps, all_losses, linewidth=2, color='#2E86AB')
+                axes[1, 1].set_xlabel('Step', fontsize=12)
+                axes[1, 1].set_ylabel('Loss (log scale)', fontsize=12)
+                axes[1, 1].set_title('Training Loss (Log Scale)', fontsize=14, fontweight='bold')
+                axes[1, 1].set_yscale('log')
+                axes[1, 1].grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                plot_path = os.path.join(OUTPUT_DIR, f"training_plot_step_{global_step}.png")
+                plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+                plt.close()
+                print(f"[OK] Saved training plot to {plot_path}")
 
 pbar.close()
+csv_file.close()
 
 print("\n[OK] Training complete!")
 print("[*] Saving final model...")
@@ -372,5 +471,46 @@ torch.save({
     'scheduler_state_dict': scheduler.state_dict(),
     'scaler_state_dict': scaler.state_dict() if use_fp16 else None,
 }, os.path.join(final_dir, "training_state.pt"))
+
+# Generate final training plot
+print("[*] Generating final training plots...")
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+# Loss plot
+axes[0, 0].plot(all_steps, all_losses, linewidth=2, color='#2E86AB')
+axes[0, 0].set_xlabel('Step', fontsize=12)
+axes[0, 0].set_ylabel('Loss', fontsize=12)
+axes[0, 0].set_title('Training Loss', fontsize=14, fontweight='bold')
+axes[0, 0].grid(True, alpha=0.3)
+
+# Learning rate plot
+axes[0, 1].plot(all_steps, all_lrs, linewidth=2, color='#A23B72')
+axes[0, 1].set_xlabel('Step', fontsize=12)
+axes[0, 1].set_ylabel('Learning Rate', fontsize=12)
+axes[0, 1].set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+axes[0, 1].grid(True, alpha=0.3)
+axes[0, 1].ticklabel_format(style='scientific', axis='y', scilimits=(0,0))
+
+# Tokens per second plot
+axes[1, 0].plot(all_steps, all_tok_per_sec, linewidth=2, color='#F18F01')
+axes[1, 0].set_xlabel('Step', fontsize=12)
+axes[1, 0].set_ylabel('Tokens/sec', fontsize=12)
+axes[1, 0].set_title('Training Throughput', fontsize=14, fontweight='bold')
+axes[1, 0].grid(True, alpha=0.3)
+
+# Loss (log scale) plot
+axes[1, 1].plot(all_steps, all_losses, linewidth=2, color='#2E86AB')
+axes[1, 1].set_xlabel('Step', fontsize=12)
+axes[1, 1].set_ylabel('Loss (log scale)', fontsize=12)
+axes[1, 1].set_title('Training Loss (Log Scale)', fontsize=14, fontweight='bold')
+axes[1, 1].set_yscale('log')
+axes[1, 1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+final_plot_path = os.path.join(OUTPUT_DIR, "training_plot_final.png")
+plt.savefig(final_plot_path, dpi=150, bbox_inches='tight')
+plt.close()
+print(f"[OK] Saved final training plot to {final_plot_path}")
+print(f"[OK] Training log saved to {csv_path}")
 
 print("[OK] Done!")
